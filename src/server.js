@@ -1,12 +1,15 @@
 /**
- * NguonC Stremio Addon – Node.js (Render) v1.0.4
- * + HLS bridge/proxy so playlist is played via our server IP (same IP that got the grant).
+ * NguonC Stremio Addon – Node.js (Render) v1.0.5
+ * - HLS bridge/proxy
+ * - Decrypt StreamC encrypted playlists (#ENC-AESGCM) using video hash
+ * - Strip known HLS ad discontinuities (from PureMovies)
  */
 
 import http from "node:http";
+import crypto from "node:crypto";
 import { decryptStreamCEnvelope } from "./crypto.js";
 
-const VERSION = "1.0.4";
+const VERSION = "1.0.5";
 const PORT = process.env.PORT || 3000;
 const NGUONC_ORIGIN = "https://phim.nguonc.com";
 const NGUONC_API = NGUONC_ORIGIN + "/api";
@@ -21,9 +24,16 @@ const CORS = {
   "Access-Control-Max-Age": "86400"
 };
 
-// In-memory grant cache: token -> { playlistUrl, embedUrl, expires }
+// token -> { playlistUrl, embedUrl, videoHash, expires }
 const grants = new Map();
-const GRANT_TTL_MS = 25 * 60 * 1000; // 25 min
+const GRANT_TTL_MS = 25 * 60 * 1000;
+
+// PureMovies-style ad patterns
+const ADS_REGEX_LIST = [
+  /(?<!#EXT-X-DISCONTINUITY[\s\S]*)#EXT-X-DISCONTINUITY\n(?:.*?\n){18,24}#EXT-X-DISCONTINUITY\n(?![\s\S]*#EXT-X-DISCONTINUITY)/g,
+  /#EXT-X-DISCONTINUITY\n(?:#EXT-X-KEY:METHOD=NONE\n(?:.*\n){18,24})?#EXT-X-DISCONTINUITY\n/g,
+  /#EXT-X-DISCONTINUITY\n#EXTINF: 3\.920000,\n.*\n#EXTINF: 0\.760000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 2\.500000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 2\.420000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 0\.780000,\n.*\n#EXTINF: 1\.960000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 1\.760000,\n.*\n#EXTINF: 3\.200000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 1\.360000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 2\.000000,\n.*\n#EXTINF: 0\.720000,\n.*/g
+];
 
 function sendJson(res, data, status = 200, extra = {}) {
   const body = JSON.stringify(data, null, 2);
@@ -41,20 +51,8 @@ function sendText(res, msg, status = 200, extra = {}) {
   res.end(msg);
 }
 
-function b64url(buf) {
-  return Buffer.from(buf).toString("base64url");
-}
-function fromB64url(s) {
-  return Buffer.from(s, "base64url").toString("utf8");
-}
-
 function makeToken() {
-  return b64url(cryptoGetRandom(16));
-}
-function cryptoGetRandom(n) {
-  const a = new Uint8Array(n);
-  for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256);
-  return a;
+  return crypto.randomBytes(16).toString("base64url");
 }
 
 function pruneGrants() {
@@ -221,17 +219,39 @@ function bootstrapPayload() {
   };
 }
 
-function openEnvelope(envelope, embedUrl) {
+/** Decrypt bootstrap envelope → { playlistUrl, videoHash } */
+function openEnvelopeFull(envelope, embedUrl) {
   const payload = decryptStreamCEnvelope(envelope, embedUrl);
-  if (payload?.turnstileEnabled || payload?.issue === "turnstile_response") throw new Error("turnstile_required");
-  if (payload?.preissued?.playlist) return payload.preissued.playlist;
-  let m3u8 = payload?.url || payload?.playlist || payload?.src || payload?.file || null;
-  if (!m3u8 && Array.isArray(payload?.sources)) {
-    const s = payload.sources.find(x => (x.file || x.src || x.url || "").includes(".m3u8"));
-    m3u8 = s?.file || s?.src || s?.url || null;
+  if (payload?.turnstileEnabled || payload?.issue === "turnstile_response") {
+    throw new Error("turnstile_required");
   }
-  if (typeof m3u8 === "string" && m3u8.includes("http")) return m3u8;
-  throw new Error("no_playlist keys=" + Object.keys(payload || {}).join(","));
+  const videoHash = String(payload?.video || "").toLowerCase();
+  if (!/^[a-f0-9]{32}$/.test(videoHash)) {
+    // try extract from embed hash as fallback
+    try {
+      const h = new URL(embedUrl).searchParams.get("hash") || "";
+      if (/^[a-f0-9]{32}$/i.test(h)) {
+        // embed hash is NOT always the video hash, but sometimes useful
+      }
+    } catch {}
+  }
+
+  let playlistUrl = payload?.preissued?.playlist || null;
+  if (!playlistUrl) {
+    playlistUrl = payload?.url || payload?.playlist || payload?.src || payload?.file || null;
+  }
+  if (!playlistUrl && Array.isArray(payload?.sources)) {
+    const s = payload.sources.find(x => (x.file || x.src || x.url || "").includes("http"));
+    playlistUrl = s?.file || s?.src || s?.url || null;
+  }
+  if (typeof playlistUrl !== "string" || !playlistUrl.startsWith("http")) {
+    throw new Error("no_playlist keys=" + Object.keys(payload || {}).join(","));
+  }
+  return {
+    playlistUrl,
+    videoHash: /^[a-f0-9]{32}$/.test(videoHash) ? videoHash : null,
+    payload
+  };
 }
 
 async function resolveStreamFromEmbed(embedUrl) {
@@ -254,8 +274,79 @@ async function resolveStreamFromEmbed(embedUrl) {
   const data = await res.json();
   let envelope = data?.format === "aesgcm-v1" ? data : data?.envelope?.format === "aesgcm-v1" ? data.envelope : null;
   if (!envelope) throw new Error("no_envelope");
-  const playlistUrl = openEnvelope(envelope, embedUrl);
-  return { playlistUrl, embedUrl };
+  const { playlistUrl, videoHash } = openEnvelopeFull(envelope, embedUrl);
+  return { playlistUrl, embedUrl, videoHash };
+}
+
+// ---------- StreamC playlist AES-GCM decrypt (from PureMovies) ----------
+function derivePlaylistKey(videoHash) {
+  // HMAC-SHA256("stream-derive-v1", videoHash) → AES-GCM key
+  return crypto.createHmac("sha256", "stream-derive-v1").update(videoHash).digest();
+}
+
+function unwrapStreamCPlaylist(raw, videoHash) {
+  raw = String(raw || "");
+  if (!raw.includes("#ENC-AESGCM") && !raw.includes("#EXT-X-B65")) {
+    if (!/^#EXTM3U(?:\r?\n|$)/.test(raw)) throw new Error("bad_streamc_playlist");
+    return raw;
+  }
+  if (!videoHash || !/^[a-f0-9]{32}$/i.test(videoHash)) {
+    throw new Error("video_hash_required_for_encrypted_playlist");
+  }
+
+  const lines = raw.trim().split(/\r?\n/);
+  const ivMatch = /^#ENC-AESGCM;iv=([a-fA-F0-9]{24})$/.exec(lines[1] || "");
+  if (
+    lines.length !== 4 ||
+    lines[0] !== "#EXTM3U" ||
+    !ivMatch ||
+    lines[2] !== "#EXT-X-B65:0-138" ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(lines[3] || "") ||
+    lines[3].length % 4 !== 0
+  ) {
+    throw new Error("bad_streamc_playlist_envelope");
+  }
+
+  const iv = Buffer.from(ivMatch[1], "hex");
+  const combined = Buffer.from(lines[3], "base64");
+  if (combined.length <= 16) throw new Error("ciphertext_too_short");
+
+  const ciphertext = combined.subarray(0, combined.length - 16);
+  const tag = combined.subarray(combined.length - 16);
+  const key = derivePlaylistKey(videoHash.toLowerCase());
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+  if (!/^#EXTM3U(?:\r?\n|$)/.test(plain)) throw new Error("bad_streamc_decrypted_playlist");
+  return plain;
+}
+
+function stripKnownAds(playlist) {
+  let out = playlist;
+  for (const regex of ADS_REGEX_LIST) {
+    regex.lastIndex = 0;
+    out = out.replace(regex, "");
+  }
+  return out;
+}
+
+function findBestVariant(playlist, baseUrl) {
+  const lines = playlist.split(/\r?\n/);
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+    const bw = /(?:^|,)BANDWIDTH=(\d+)/.exec(line)?.[1];
+    let j = i + 1;
+    while (j < lines.length && (!lines[j].trim() || lines[j].trim().startsWith("#"))) j++;
+    if (j >= lines.length) continue;
+    try {
+      variants.push({ bandwidth: Number(bw || 0), url: new URL(lines[j].trim(), baseUrl).href });
+    } catch {}
+  }
+  variants.sort((a, b) => b.bandwidth - a.bandwidth);
+  return variants[0]?.url || null;
 }
 
 function languageLabel(serverName) {
@@ -274,20 +365,18 @@ function episodeMatches(epName, season, episode) {
     s.includes(`s${season}e${ep}`) || new RegExp(`(?:^|\\D)${ep}(?:\\D|$)`).test(s);
 }
 
-function registerGrant(playlistUrl, embedUrl) {
+function registerGrant(playlistUrl, embedUrl, videoHash) {
   pruneGrants();
   const token = makeToken();
   grants.set(token, {
     playlistUrl,
     embedUrl,
+    videoHash,
     expires: Date.now() + GRANT_TTL_MS
   });
   return token;
 }
 
-/**
- * Fetch upstream URL with streamc-friendly headers.
- */
 async function fetchUpstream(targetUrl, embedUrl, rangeHeader) {
   const headers = {
     "User-Agent": USER_AGENT,
@@ -300,9 +389,6 @@ async function fetchUpstream(targetUrl, embedUrl, rangeHeader) {
   return fetch(targetUrl, { headers });
 }
 
-/**
- * Rewrite m3u8 so all segment / sub-playlist URLs go through our proxy.
- */
 function rewriteM3u8(body, baseUrl, token, origin) {
   const base = new URL(baseUrl);
   const lines = body.split(/\r?\n/);
@@ -310,19 +396,20 @@ function rewriteM3u8(body, baseUrl, token, origin) {
   for (const line of lines) {
     const t = line.trim();
     if (!t || t.startsWith("#")) {
-      // Keep tags; rewrite URI="..." inside tags if present
       if (/URI="/i.test(t)) {
         out.push(t.replace(/URI="([^"]+)"/gi, (_, uri) => {
-          const abs = new URL(uri, base).href;
-          const proxied = `${origin}/hls/${token}?u=${encodeURIComponent(abs)}`;
-          return `URI="${proxied}"`;
+          try {
+            const abs = new URL(uri, base).href;
+            return `URI="${origin}/hls/${token}?u=${encodeURIComponent(abs)}"`;
+          } catch {
+            return `URI="${uri}"`;
+          }
         }));
       } else {
         out.push(line);
       }
       continue;
     }
-    // Segment or sub-playlist URL
     try {
       const abs = new URL(t, base).href;
       out.push(`${origin}/hls/${token}?u=${encodeURIComponent(abs)}`);
@@ -333,6 +420,37 @@ function rewriteM3u8(body, baseUrl, token, origin) {
   return out.join("\n");
 }
 
+/**
+ * Fetch playlist, decrypt if needed, follow master → media, strip ads, rewrite URLs.
+ */
+async function resolveCleanPlaylist(playlistUrl, embedUrl, videoHash, depth = 0) {
+  if (depth > 4) throw new Error("master_depth_exceeded");
+
+  const res = await fetchUpstream(playlistUrl, embedUrl, null);
+  if (!res.ok) throw new Error("playlist_http_" + res.status);
+  let raw = await res.text();
+  const finalUrl = res.url || playlistUrl;
+
+  // Decrypt StreamC encrypted playlist
+  try {
+    raw = unwrapStreamCPlaylist(raw, videoHash);
+  } catch (e) {
+    // If not encrypted, unwrap throws only on bad format; plain #EXTM3U is ok
+    if (!raw.includes("#EXTM3U")) throw e;
+  }
+
+  // Master playlist → pick best variant and recurse
+  if (raw.includes("#EXT-X-STREAM-INF")) {
+    const best = findBestVariant(raw, finalUrl);
+    if (!best) throw new Error("master_without_variant");
+    return resolveCleanPlaylist(best, embedUrl, videoHash, depth + 1);
+  }
+
+  // Media playlist: strip ads
+  raw = stripKnownAds(raw);
+  return { playlist: raw, url: finalUrl };
+}
+
 async function handleHlsProxy(req, res, token, targetUrl, origin) {
   const grant = grants.get(token);
   if (!grant || grant.expires < Date.now()) {
@@ -340,6 +458,28 @@ async function handleHlsProxy(req, res, token, targetUrl, origin) {
   }
 
   const range = req.headers.range || null;
+  const isLikelyPlaylist = targetUrl.includes(".m3u8") ||
+    targetUrl.includes("mpegurl") ||
+    !/\.(ts|m4s|mp4|aac|vtt|key)(\?|$)/i.test(targetUrl);
+
+  // For the root playlist (same as grant.playlistUrl) or any m3u8: decrypt + rewrite
+  if (isLikelyPlaylist && !range) {
+    try {
+      const { playlist, url } = await resolveCleanPlaylist(targetUrl, grant.embedUrl, grant.videoHash);
+      const rewritten = rewriteM3u8(playlist, url, token, origin);
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "no-cache",
+        ...CORS
+      });
+      return res.end(rewritten);
+    } catch (e) {
+      console.log("[playlist proxy]", e.message);
+      // fall through to binary proxy
+    }
+  }
+
+  // Binary segment / key / fallback
   let upstream;
   try {
     upstream = await fetchUpstream(targetUrl, grant.embedUrl, range);
@@ -348,22 +488,6 @@ async function handleHlsProxy(req, res, token, targetUrl, origin) {
   }
 
   const status = upstream.status;
-  const contentType = upstream.headers.get("content-type") || "";
-  const isPlaylist = /mpegurl|m3u8|application\/vnd\.apple\.mpegurl|text\/plain/i.test(contentType) ||
-    targetUrl.includes(".m3u8") || targetUrl.includes("mpegurl");
-
-  if (isPlaylist && status >= 200 && status < 300) {
-    const text = await upstream.text();
-    const rewritten = rewriteM3u8(text, targetUrl, token, origin);
-    res.writeHead(200, {
-      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      "Cache-Control": "no-cache",
-      ...CORS
-    });
-    return res.end(rewritten);
-  }
-
-  // Binary segment (ts / m4s / key) – stream through
   const headers = { ...CORS };
   const ct = upstream.headers.get("content-type");
   if (ct) headers["Content-Type"] = ct;
@@ -375,9 +499,27 @@ async function handleHlsProxy(req, res, token, targetUrl, origin) {
   if (ar) headers["Accept-Ranges"] = ar;
   headers["Cache-Control"] = "public, max-age=3600";
 
+  // If upstream returned a playlist text unexpectedly, try decrypt path
+  if (ct && /mpegurl|m3u8|text\/plain/i.test(ct) && status >= 200 && status < 300) {
+    try {
+      let text = await upstream.text();
+      text = unwrapStreamCPlaylist(text, grant.videoHash);
+      text = stripKnownAds(text);
+      const rewritten = rewriteM3u8(text, targetUrl, token, origin);
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "no-cache",
+        ...CORS
+      });
+      return res.end(rewritten);
+    } catch {
+      // already consumed body – can't re-stream; error
+      return sendText(res, "playlist decrypt failed", 502);
+    }
+  }
+
   res.writeHead(status, headers);
   if (req.method === "HEAD") return res.end();
-
   const buf = Buffer.from(await upstream.arrayBuffer());
   res.end(buf);
 }
@@ -428,12 +570,11 @@ async function handleStream(type, id, origin) {
 
   await Promise.all(toTry.map(async (c) => {
     try {
-      const { playlistUrl, embedUrl } = await resolveStreamFromEmbed(c.embed);
+      const { playlistUrl, embedUrl, videoHash } = await resolveStreamFromEmbed(c.embed);
       if (!playlistUrl || seen.has(playlistUrl)) return;
       seen.add(playlistUrl);
 
-      const token = registerGrant(playlistUrl, embedUrl);
-      // Bridge URL – player requests our server, we fetch from streamc with grant IP
+      const token = registerGrant(playlistUrl, embedUrl, videoHash);
       const bridged = `${origin}/hls/${token}?u=${encodeURIComponent(playlistUrl)}`;
 
       const lang = languageLabel(c.server);
@@ -443,14 +584,7 @@ async function handleStream(type, id, origin) {
         name: `${c.server} • ${c.episode}`,
         behaviorHints: {
           bingeGroup: `nguonc-${match.slug}-${lang}`,
-          notWebReady: false,
-          proxyHeaders: {
-            request: {
-              "User-Agent": USER_AGENT,
-              "Referer": embedUrl,
-              "Origin": new URL(embedUrl).origin
-            }
-          }
+          notWebReady: false
         }
       });
     } catch (e) {
@@ -469,12 +603,40 @@ async function handleDebug(url, origin) {
   const imdb = url.searchParams.get("id") || "tt0111161";
   const type = url.searchParams.get("type") || "movie";
   const result = await handleStream(type, imdb, origin);
+
+  // Extra: try to show whether first playlist decrypts
+  let decryptTest = null;
+  if (result.streams?.[0]) {
+    try {
+      const u = new URL(result.streams[0].url);
+      const token = u.pathname.split("/").pop();
+      const grant = grants.get(token);
+      if (grant) {
+        const { playlist, url: finalUrl } = await resolveCleanPlaylist(
+          grant.playlistUrl, grant.embedUrl, grant.videoHash
+        );
+        decryptTest = {
+          ok: true,
+          videoHash: grant.videoHash,
+          playlistUrl: grant.playlistUrl.slice(0, 80),
+          finalUrl: finalUrl.slice(0, 80),
+          playlistPreview: playlist.slice(0, 300),
+          hasExtInf: playlist.includes("#EXTINF"),
+          lineCount: playlist.split("\n").length
+        };
+      }
+    } catch (e) {
+      decryptTest = { ok: false, error: e.message };
+    }
+  }
+
   return {
     version: VERSION,
     request: { type, id: imdb },
     streamCount: result.streams?.length || 0,
     streams: result.streams,
-    note: "URLs are bridged via /hls/{token} so playback uses server IP"
+    decryptTest,
+    note: "v1.0.5 decrypts #ENC-AESGCM playlists + strips ads"
   };
 }
 
@@ -505,7 +667,6 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, data);
     }
 
-    // HLS bridge: /hls/{token}?u=<encoded upstream url>
     const hlsMatch = path.match(/^\/hls\/([A-Za-z0-9_-]+)$/);
     if (hlsMatch) {
       const token = hlsMatch[1];
