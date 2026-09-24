@@ -1,6 +1,6 @@
 /**
- * NguonC Stremio Addon – Node.js (Render) v1.0.5
- * - HLS bridge/proxy
+ * NguonC Stremio Addon – Node.js (Render) v1.0.6
+ * - HLS playlist bridge; video segments load directly from the CDN
  * - Decrypt StreamC encrypted playlists (#ENC-AESGCM) using video hash
  * - Strip known HLS ad discontinuities (from PureMovies)
  */
@@ -9,7 +9,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { decryptStreamCEnvelope } from "./crypto.js";
 
-const VERSION = "1.0.5";
+const VERSION = "1.0.6";
 const PORT = process.env.PORT || 3000;
 const NGUONC_ORIGIN = "https://phim.nguonc.com";
 const NGUONC_API = NGUONC_ORIGIN + "/api";
@@ -389,7 +389,7 @@ async function fetchUpstream(targetUrl, embedUrl, rangeHeader) {
   return fetch(targetUrl, { headers });
 }
 
-function rewriteM3u8(body, baseUrl, token, origin) {
+export function rewriteM3u8(body, baseUrl) {
   const base = new URL(baseUrl);
   const lines = body.split(/\r?\n/);
   const out = [];
@@ -400,7 +400,7 @@ function rewriteM3u8(body, baseUrl, token, origin) {
         out.push(t.replace(/URI="([^"]+)"/gi, (_, uri) => {
           try {
             const abs = new URL(uri, base).href;
-            return `URI="${origin}/hls/${token}?u=${encodeURIComponent(abs)}"`;
+            return `URI="${abs}"`;
           } catch {
             return `URI="${uri}"`;
           }
@@ -412,7 +412,7 @@ function rewriteM3u8(body, baseUrl, token, origin) {
     }
     try {
       const abs = new URL(t, base).href;
-      out.push(`${origin}/hls/${token}?u=${encodeURIComponent(abs)}`);
+      out.push(abs);
     } catch {
       out.push(line);
     }
@@ -451,77 +451,33 @@ async function resolveCleanPlaylist(playlistUrl, embedUrl, videoHash, depth = 0)
   return { playlist: raw, url: finalUrl };
 }
 
-async function handleHlsProxy(req, res, token, targetUrl, origin) {
+async function handleHlsProxy(req, res, token, targetUrl) {
   const grant = grants.get(token);
   if (!grant || grant.expires < Date.now()) {
     return sendText(res, "grant expired", 410);
   }
 
-  const range = req.headers.range || null;
-  const isLikelyPlaylist = targetUrl.includes(".m3u8") ||
-    targetUrl.includes("mpegurl") ||
-    !/\.(ts|m4s|mp4|aac|vtt|key)(\?|$)/i.test(targetUrl);
-
-  // For the root playlist (same as grant.playlistUrl) or any m3u8: decrypt + rewrite
-  if (isLikelyPlaylist && !range) {
-    try {
-      const { playlist, url } = await resolveCleanPlaylist(targetUrl, grant.embedUrl, grant.videoHash);
-      const rewritten = rewriteM3u8(playlist, url, token, origin);
-      res.writeHead(200, {
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        "Cache-Control": "no-cache",
-        ...CORS
-      });
-      return res.end(rewritten);
-    } catch (e) {
-      console.log("[playlist proxy]", e.message);
-      // fall through to binary proxy
-    }
-  }
-
-  // Binary segment / key / fallback
-  let upstream;
+  // Only the playlist issued with this grant is fetched by Render. In
+  // particular, StreamC video segments use a .html suffix, so extension
+  // based playlist detection would fetch each video segment twice.
+  if (targetUrl !== grant.playlistUrl) return sendText(res, "invalid playlist URL", 403);
+  const started = Date.now();
   try {
-    upstream = await fetchUpstream(targetUrl, grant.embedUrl, range);
+    const { playlist, url } = await resolveCleanPlaylist(targetUrl, grant.embedUrl, grant.videoHash);
+    const rewritten = rewriteM3u8(playlist, url);
+    console.log(JSON.stringify({ event: "HLS_PLAYLIST", result: "ok", ms: Date.now() - started,
+      segments: (rewritten.match(/^#EXTINF:/gm) || []).length }));
+    res.writeHead(200, {
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "Cache-Control": "no-cache",
+      ...CORS
+    });
+    return res.end(req.method === "HEAD" ? undefined : rewritten);
   } catch (e) {
-    return sendText(res, "upstream fetch failed: " + e.message, 502);
+    console.error(JSON.stringify({ event: "HLS_PLAYLIST", result: "fail",
+      ms: Date.now() - started, error: e.message }));
+    return sendText(res, "playlist unavailable", 502);
   }
-
-  const status = upstream.status;
-  const headers = { ...CORS };
-  const ct = upstream.headers.get("content-type");
-  if (ct) headers["Content-Type"] = ct;
-  const cl = upstream.headers.get("content-length");
-  if (cl) headers["Content-Length"] = cl;
-  const cr = upstream.headers.get("content-range");
-  if (cr) headers["Content-Range"] = cr;
-  const ar = upstream.headers.get("accept-ranges");
-  if (ar) headers["Accept-Ranges"] = ar;
-  headers["Cache-Control"] = "public, max-age=3600";
-
-  // If upstream returned a playlist text unexpectedly, try decrypt path
-  if (ct && /mpegurl|m3u8|text\/plain/i.test(ct) && status >= 200 && status < 300) {
-    try {
-      let text = await upstream.text();
-      text = unwrapStreamCPlaylist(text, grant.videoHash);
-      text = stripKnownAds(text);
-      const rewritten = rewriteM3u8(text, targetUrl, token, origin);
-      res.writeHead(200, {
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        "Cache-Control": "no-cache",
-        ...CORS
-      });
-      return res.end(rewritten);
-    } catch {
-      // already consumed body – can't re-stream; error
-      return sendText(res, "playlist decrypt failed", 502);
-    }
-  }
-
-  res.writeHead(status, headers);
-  if (req.method === "HEAD") return res.end();
-  const buf = Buffer.from(await upstream.arrayBuffer());
-  res.end(buf);
 }
 
 async function handleStream(type, id, origin) {
@@ -636,7 +592,7 @@ async function handleDebug(url, origin) {
     streamCount: result.streams?.length || 0,
     streams: result.streams,
     decryptTest,
-    note: "v1.0.5 decrypts #ENC-AESGCM playlists + strips ads"
+    note: "v1.0.6 decrypts playlists, strips ads, and serves direct CDN segments"
   };
 }
 
@@ -672,9 +628,9 @@ const server = http.createServer(async (req, res) => {
       const token = hlsMatch[1];
       const target = url.searchParams.get("u");
       if (!target) return sendText(res, "missing u", 400);
-      let decoded;
-      try { decoded = decodeURIComponent(target); } catch { decoded = target; }
-      return handleHlsProxy(req, res, token, decoded, origin);
+      // URLSearchParams has decoded the query value already. Decoding again
+      // would change signed playlist URLs containing literal % escapes.
+      return handleHlsProxy(req, res, token, target);
     }
 
     const streamMatch = path.match(/^\/stream\/(movie|series)\/([^/]+)\.json$/i);
@@ -692,6 +648,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`NguonC Stremio Addon v${VERSION} listening on port ${PORT}`);
-});
+export { server, registerGrant };
+
+if (process.env.NODE_ENV !== "test") {
+  server.listen(PORT, () => {
+    console.log(`NguonC Stremio Addon v${VERSION} listening on port ${PORT}`);
+  });
+}
