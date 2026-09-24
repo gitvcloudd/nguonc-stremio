@@ -1,12 +1,12 @@
 /**
- * NguonC Stremio Addon – Node.js server (Render / VPS) v1.0.3
- * Same logic as CF Worker version, but runs as standard HTTP server.
+ * NguonC Stremio Addon – Node.js (Render) v1.0.4
+ * + HLS bridge/proxy so playlist is played via our server IP (same IP that got the grant).
  */
 
 import http from "node:http";
 import { decryptStreamCEnvelope } from "./crypto.js";
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const PORT = process.env.PORT || 3000;
 const NGUONC_ORIGIN = "https://phim.nguonc.com";
 const NGUONC_API = NGUONC_ORIGIN + "/api";
@@ -16,9 +16,14 @@ const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Range",
+  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
   "Access-Control-Max-Age": "86400"
 };
+
+// In-memory grant cache: token -> { playlistUrl, embedUrl, expires }
+const grants = new Map();
+const GRANT_TTL_MS = 25 * 60 * 1000; // 25 min
 
 function sendJson(res, data, status = 200, extra = {}) {
   const body = JSON.stringify(data, null, 2);
@@ -31,9 +36,32 @@ function sendJson(res, data, status = 200, extra = {}) {
   res.end(body);
 }
 
-function sendText(res, msg, status = 200) {
-  res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", ...CORS });
+function sendText(res, msg, status = 200, extra = {}) {
+  res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", ...CORS, ...extra });
   res.end(msg);
+}
+
+function b64url(buf) {
+  return Buffer.from(buf).toString("base64url");
+}
+function fromB64url(s) {
+  return Buffer.from(s, "base64url").toString("utf8");
+}
+
+function makeToken() {
+  return b64url(cryptoGetRandom(16));
+}
+function cryptoGetRandom(n) {
+  const a = new Uint8Array(n);
+  for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256);
+  return a;
+}
+
+function pruneGrants() {
+  const now = Date.now();
+  for (const [k, v] of grants) {
+    if (v.expires < now) grants.delete(k);
+  }
 }
 
 async function fetchJson(url, opts = {}) {
@@ -202,101 +230,32 @@ function openEnvelope(envelope, embedUrl) {
     const s = payload.sources.find(x => (x.file || x.src || x.url || "").includes(".m3u8"));
     m3u8 = s?.file || s?.src || s?.url || null;
   }
-  if (typeof m3u8 === "string" && m3u8.includes(".m3u8")) return m3u8;
+  if (typeof m3u8 === "string" && m3u8.includes("http")) return m3u8;
   throw new Error("no_playlist keys=" + Object.keys(payload || {}).join(","));
 }
 
 async function resolveStreamFromEmbed(embedUrl) {
   if (!isValidStreamCEmbed(embedUrl)) throw new Error("invalid_embed_url");
   const embedOrigin = new URL(embedUrl).origin;
-  const debug = { attempts: [] };
 
-  // POST bootstrap
-  try {
-    const res = await fetch(embedUrl, {
-      method: "POST",
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Content-Type": "application/json",
-        "Origin": embedOrigin,
-        "Referer": embedUrl
-      },
-      body: JSON.stringify(bootstrapPayload())
-    });
-    debug.attempts.push({ method: "POST bootstrap", status: res.status });
-    if (res.ok) {
-      const data = await res.json();
-      let envelope = data?.format === "aesgcm-v1" ? data : data?.envelope?.format === "aesgcm-v1" ? data.envelope : null;
-      if (envelope) return { m3u8: openEnvelope(envelope, embedUrl), debug };
-      debug.attempts[0].bodyPreview = JSON.stringify(data).slice(0, 300);
-    } else {
-      debug.attempts[0].bodyPreview = (await res.text().catch(() => "")).slice(0, 200);
-    }
-  } catch (e) {
-    debug.attempts.push({ method: "POST bootstrap", error: e.message });
-  }
-
-  // GET then POST
-  try {
-    const getRes = await fetch(embedUrl, {
-      method: "GET",
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer": NGUONC_ORIGIN + "/"
-      }
-    });
-    debug.attempts.push({ method: "GET embed", status: getRes.status });
-    if (getRes.ok) {
-      const res2 = await fetch(embedUrl, {
-        method: "POST",
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Accept": "*/*",
-          "Content-Type": "application/json",
-          "Origin": embedOrigin,
-          "Referer": embedUrl
-        },
-        body: JSON.stringify(bootstrapPayload())
-      });
-      debug.attempts.push({ method: "POST after GET", status: res2.status });
-      if (res2.ok) {
-        const data = await res2.json();
-        let envelope = data?.format === "aesgcm-v1" ? data : data?.envelope?.format === "aesgcm-v1" ? data.envelope : null;
-        if (envelope) return { m3u8: openEnvelope(envelope, embedUrl), debug };
-      }
-    }
-  } catch (e) {
-    debug.attempts.push({ method: "GET+POST", error: e.message });
-  }
-
-  // POST with NguonC referer
-  try {
-    const res = await fetch(embedUrl, {
-      method: "POST",
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Content-Type": "application/json",
-        "Origin": NGUONC_ORIGIN,
-        "Referer": NGUONC_ORIGIN + "/"
-      },
-      body: JSON.stringify(bootstrapPayload())
-    });
-    debug.attempts.push({ method: "POST referer=nguonc", status: res.status });
-    if (res.ok) {
-      const data = await res.json();
-      let envelope = data?.format === "aesgcm-v1" ? data : data?.envelope?.format === "aesgcm-v1" ? data.envelope : null;
-      if (envelope) return { m3u8: openEnvelope(envelope, embedUrl), debug };
-    }
-  } catch (e) {
-    debug.attempts.push({ method: "POST referer=nguonc", error: e.message });
-  }
-
-  throw new Error("all_bootstrap_failed: " + JSON.stringify(debug.attempts));
+  const res = await fetch(embedUrl, {
+    method: "POST",
+    headers: {
+      "User-Agent": USER_AGENT,
+      "Accept": "*/*",
+      "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Content-Type": "application/json",
+      "Origin": embedOrigin,
+      "Referer": embedUrl
+    },
+    body: JSON.stringify(bootstrapPayload())
+  });
+  if (!res.ok) throw new Error("bootstrap_http_" + res.status);
+  const data = await res.json();
+  let envelope = data?.format === "aesgcm-v1" ? data : data?.envelope?.format === "aesgcm-v1" ? data.envelope : null;
+  if (!envelope) throw new Error("no_envelope");
+  const playlistUrl = openEnvelope(envelope, embedUrl);
+  return { playlistUrl, embedUrl };
 }
 
 function languageLabel(serverName) {
@@ -315,7 +274,115 @@ function episodeMatches(epName, season, episode) {
     s.includes(`s${season}e${ep}`) || new RegExp(`(?:^|\\D)${ep}(?:\\D|$)`).test(s);
 }
 
-async function handleStream(type, id) {
+function registerGrant(playlistUrl, embedUrl) {
+  pruneGrants();
+  const token = makeToken();
+  grants.set(token, {
+    playlistUrl,
+    embedUrl,
+    expires: Date.now() + GRANT_TTL_MS
+  });
+  return token;
+}
+
+/**
+ * Fetch upstream URL with streamc-friendly headers.
+ */
+async function fetchUpstream(targetUrl, embedUrl, rangeHeader) {
+  const headers = {
+    "User-Agent": USER_AGENT,
+    "Accept": "*/*",
+    "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+    "Origin": new URL(embedUrl).origin,
+    "Referer": embedUrl
+  };
+  if (rangeHeader) headers["Range"] = rangeHeader;
+  return fetch(targetUrl, { headers });
+}
+
+/**
+ * Rewrite m3u8 so all segment / sub-playlist URLs go through our proxy.
+ */
+function rewriteM3u8(body, baseUrl, token, origin) {
+  const base = new URL(baseUrl);
+  const lines = body.split(/\r?\n/);
+  const out = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) {
+      // Keep tags; rewrite URI="..." inside tags if present
+      if (/URI="/i.test(t)) {
+        out.push(t.replace(/URI="([^"]+)"/gi, (_, uri) => {
+          const abs = new URL(uri, base).href;
+          const proxied = `${origin}/hls/${token}?u=${encodeURIComponent(abs)}`;
+          return `URI="${proxied}"`;
+        }));
+      } else {
+        out.push(line);
+      }
+      continue;
+    }
+    // Segment or sub-playlist URL
+    try {
+      const abs = new URL(t, base).href;
+      out.push(`${origin}/hls/${token}?u=${encodeURIComponent(abs)}`);
+    } catch {
+      out.push(line);
+    }
+  }
+  return out.join("\n");
+}
+
+async function handleHlsProxy(req, res, token, targetUrl, origin) {
+  const grant = grants.get(token);
+  if (!grant || grant.expires < Date.now()) {
+    return sendText(res, "grant expired", 410);
+  }
+
+  const range = req.headers.range || null;
+  let upstream;
+  try {
+    upstream = await fetchUpstream(targetUrl, grant.embedUrl, range);
+  } catch (e) {
+    return sendText(res, "upstream fetch failed: " + e.message, 502);
+  }
+
+  const status = upstream.status;
+  const contentType = upstream.headers.get("content-type") || "";
+  const isPlaylist = /mpegurl|m3u8|application\/vnd\.apple\.mpegurl|text\/plain/i.test(contentType) ||
+    targetUrl.includes(".m3u8") || targetUrl.includes("mpegurl");
+
+  if (isPlaylist && status >= 200 && status < 300) {
+    const text = await upstream.text();
+    const rewritten = rewriteM3u8(text, targetUrl, token, origin);
+    res.writeHead(200, {
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "Cache-Control": "no-cache",
+      ...CORS
+    });
+    return res.end(rewritten);
+  }
+
+  // Binary segment (ts / m4s / key) – stream through
+  const headers = { ...CORS };
+  const ct = upstream.headers.get("content-type");
+  if (ct) headers["Content-Type"] = ct;
+  const cl = upstream.headers.get("content-length");
+  if (cl) headers["Content-Length"] = cl;
+  const cr = upstream.headers.get("content-range");
+  if (cr) headers["Content-Range"] = cr;
+  const ar = upstream.headers.get("accept-ranges");
+  if (ar) headers["Accept-Ranges"] = ar;
+  headers["Cache-Control"] = "public, max-age=3600";
+
+  res.writeHead(status, headers);
+  if (req.method === "HEAD") return res.end();
+
+  const buf = Buffer.from(await upstream.arrayBuffer());
+  res.end(buf);
+}
+
+async function handleStream(type, id, origin) {
   const parts = id.split(":");
   const imdbId = parts[0];
   const season = parts[1] ? parseInt(parts[1], 10) : null;
@@ -361,18 +428,34 @@ async function handleStream(type, id) {
 
   await Promise.all(toTry.map(async (c) => {
     try {
-      const { m3u8 } = await resolveStreamFromEmbed(c.embed);
-      if (m3u8 && !seen.has(m3u8)) {
-        seen.add(m3u8);
-        const lang = languageLabel(c.server);
-        streams.push({
-          url: m3u8,
-          title: `NguonC • ${lang}`,
-          name: `${c.server} • ${c.episode}`,
-          behaviorHints: { bingeGroup: `nguonc-${match.slug}-${lang}`, notWebReady: false }
-        });
-      }
-    } catch (_) {}
+      const { playlistUrl, embedUrl } = await resolveStreamFromEmbed(c.embed);
+      if (!playlistUrl || seen.has(playlistUrl)) return;
+      seen.add(playlistUrl);
+
+      const token = registerGrant(playlistUrl, embedUrl);
+      // Bridge URL – player requests our server, we fetch from streamc with grant IP
+      const bridged = `${origin}/hls/${token}?u=${encodeURIComponent(playlistUrl)}`;
+
+      const lang = languageLabel(c.server);
+      streams.push({
+        url: bridged,
+        title: `NguonC • ${lang}`,
+        name: `${c.server} • ${c.episode}`,
+        behaviorHints: {
+          bingeGroup: `nguonc-${match.slug}-${lang}`,
+          notWebReady: false,
+          proxyHeaders: {
+            request: {
+              "User-Agent": USER_AGENT,
+              "Referer": embedUrl,
+              "Origin": new URL(embedUrl).origin
+            }
+          }
+        }
+      });
+    } catch (e) {
+      console.log("[resolve]", c.server, e.message);
+    }
   }));
 
   streams.sort((a, b) => {
@@ -382,67 +465,24 @@ async function handleStream(type, id) {
   return { streams };
 }
 
-async function handleDebug(url) {
+async function handleDebug(url, origin) {
   const imdb = url.searchParams.get("id") || "tt0111161";
   const type = url.searchParams.get("type") || "movie";
-  const steps = {};
-
-  const cm = await getCinemeta(type === "series" ? "series" : "movie", imdb);
-  steps.cinemeta = { ok: !!cm.meta, error: cm.error, name: cm.meta?.name, originalName: cm.meta?.originalName, year: cm.meta?.releaseInfo };
-  if (!cm.meta) return { version: VERSION, request: { type, id: imdb }, steps, streamCount: 0, streams: [] };
-
-  const queries = [cm.meta.originalName, cm.meta.name,
-    cm.meta.name && cm.meta.releaseInfo ? `${cm.meta.name} ${String(cm.meta.releaseInfo).slice(0, 4)}` : null
-  ].filter(Boolean);
-  steps.queries = queries;
-  steps.searches = [];
-
-  let match = null, detail = null, detailInfo = null;
-  for (const q of queries) {
-    const sr = await searchNguonC(q);
-    const picked = pickBestMatch(sr.items, cm.meta);
-    steps.searches.push({
-      query: q, error: sr.error, itemCount: sr.items.length,
-      sample: sr.items.slice(0, 3).map(it => ({ name: it.name, origin: it.origin_name || it.original_name, year: it.year, slug: it.slug })),
-      bestScore: picked?.score, bestSlug: picked?.item?.slug, bestName: picked?.item?.name
-    });
-    if (picked?.item?.slug && !detail) {
-      match = picked.item;
-      detailInfo = await getFilmDetail(match.slug);
-      detail = detailInfo.movie;
-    }
-  }
-
-  steps.match = match ? { slug: match.slug, name: match.name } : null;
-  steps.detail = { ok: !!detail, error: detailInfo?.error, hasEpisodes: Array.isArray(detail?.episodes), episodesLength: detail?.episodes?.length };
-
-  let candidates = detail ? extractServers(detail) : [];
-  steps.extractFromApi = { count: candidates.length, sample: candidates.slice(0, 3).map(c => ({ server: c.server, episode: c.episode, embed: c.embed.slice(0, 90) })) };
-
-  if (!candidates.length && match?.slug) {
-    const scraped = await scrapeEmbedsFromPage(match.slug);
-    candidates = scraped.items || [];
-    steps.scrapePage = { count: candidates.length, error: scraped.error };
-  }
-
-  steps.resolve = [];
-  for (const c of candidates.slice(0, 2)) {
-    try {
-      const { m3u8, debug } = await resolveStreamFromEmbed(c.embed);
-      steps.resolve.push({ server: c.server, episode: c.episode, embed: c.embed.slice(0, 90), ok: true, m3u8: m3u8.slice(0, 120), attempts: debug.attempts });
-    } catch (e) {
-      steps.resolve.push({ server: c.server, episode: c.episode, embed: c.embed.slice(0, 90), ok: false, error: e.message });
-    }
-  }
-
-  const final = await handleStream(type, imdb);
-  return { version: VERSION, request: { type, id: imdb }, steps, streamCount: final.streams?.length || 0, streams: final.streams };
+  const result = await handleStream(type, imdb, origin);
+  return {
+    version: VERSION,
+    request: { type, id: imdb },
+    streamCount: result.streams?.length || 0,
+    streams: result.streams,
+    note: "URLs are bridged via /hls/{token} so playback uses server IP"
+  };
 }
 
-// ---------- HTTP server ----------
 const server = http.createServer(async (req, res) => {
   try {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const host = req.headers.host || "localhost";
+    const origin = `https://${host}`;
+    const url = new URL(req.url || "/", `http://${host}`);
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     if (req.method === "OPTIONS") {
@@ -451,7 +491,6 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === "/" || path === "/manifest.json") {
-      const origin = `https://${req.headers.host || "localhost"}`;
       return sendJson(res, buildManifest(origin));
     }
 
@@ -462,16 +501,27 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === "/debug") {
-      const data = await handleDebug(url);
+      const data = await handleDebug(url, origin);
       return sendJson(res, data);
+    }
+
+    // HLS bridge: /hls/{token}?u=<encoded upstream url>
+    const hlsMatch = path.match(/^\/hls\/([A-Za-z0-9_-]+)$/);
+    if (hlsMatch) {
+      const token = hlsMatch[1];
+      const target = url.searchParams.get("u");
+      if (!target) return sendText(res, "missing u", 400);
+      let decoded;
+      try { decoded = decodeURIComponent(target); } catch { decoded = target; }
+      return handleHlsProxy(req, res, token, decoded, origin);
     }
 
     const streamMatch = path.match(/^\/stream\/(movie|series)\/([^/]+)\.json$/i);
     if (streamMatch) {
       const type = streamMatch[1].toLowerCase();
       const id = decodeURIComponent(streamMatch[2]);
-      const result = await handleStream(type, id);
-      return sendJson(res, result, 200, { "Cache-Control": "public, max-age=120" });
+      const result = await handleStream(type, id, origin);
+      return sendJson(res, result, 200, { "Cache-Control": "no-cache" });
     }
 
     sendText(res, `NguonC Stremio Addon v${VERSION}\nManifest: /manifest.json\nDebug: /debug?id=tt0111161`);
