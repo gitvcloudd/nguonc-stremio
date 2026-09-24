@@ -1,12 +1,13 @@
 {
   "name": "nguonc-stremio",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "private": true,
   "type": "module",
   "description": "NguonC stream provider for Stremio (Render / Node)",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "NODE_ENV=test node --test"
   },
   "engines": {
     "node": ">=18"
